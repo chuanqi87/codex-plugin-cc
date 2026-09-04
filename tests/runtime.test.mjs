@@ -472,6 +472,9 @@ test("review logs reasoning summaries and review output to the job log", () => {
   assert.equal(result.status, 0, result.stderr);
   const stateDir = resolveStateDir(repo);
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.version, 2);
+  assert.equal(state.jobs[0].hostId, "claude-code");
+  assert.equal(state.jobs[0].backendId, "codex");
   const log = fs.readFileSync(state.jobs[0].logFile, "utf8");
   assert.match(log, /Reasoning summary/);
   assert.match(log, /Reviewed the changed files and checked the likely regression paths/);
@@ -694,7 +697,7 @@ test("session start hook exports the Claude session id, transcript path, and plu
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     fs.readFileSync(envFile, "utf8"),
-    `export CODEX_COMPANION_SESSION_ID='sess-current'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'\nexport CLAUDE_PLUGIN_DATA='${pluginDataDir}'\n`
+    `export CODEX_COMPANION_SESSION_ID='sess-current'\nexport AGENT_BRIDGE_SESSION_ID='sess-current'\nexport AGENT_BRIDGE_HOST='claude-code'\nexport AGENT_BRIDGE_BACKEND='codex'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'\nexport CLAUDE_PLUGIN_DATA='${pluginDataDir}'\n`
   );
 });
 

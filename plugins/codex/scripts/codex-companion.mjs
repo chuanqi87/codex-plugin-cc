@@ -7,21 +7,8 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
-import {
-    buildPersistentTaskThreadName,
-    DEFAULT_CONTINUE_PROMPT,
-    findLatestTaskThread,
-    getCodexAuthStatus,
-    getCodexAvailability,
-    getSessionRuntimeStatus,
-    importExternalAgentSession,
-    interruptAppServerTurn,
-    parseStructuredOutput,
-    readOutputSchema,
-    runAppServerReview,
-    runAppServerTurn
-  } from "./lib/codex.mjs";
-import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
+import { listBackendAdapters, resolveBackendForJob } from "./lib/backend-adapters.mjs";
+import { assertBridgeCapability, resolveBridgeContext } from "./lib/bridge-context.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
@@ -49,10 +36,10 @@ import {
   createJobRecord,
   createProgressReporter,
   nowIso,
-  runTrackedJob,
-  SESSION_ID_ENV
+  runTrackedJob
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import { listHostAdapters } from "./lib/host-adapters.mjs";
 import {
   renderNativeReviewResult,
   renderReviewResult,
@@ -68,24 +55,53 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
-const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
-const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
-const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
-      "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
+      "  node scripts/codex-companion.mjs adapters [--json]",
+      "  node scripts/codex-companion.mjs setup [--host <id>] [--backend <id>] [--enable-review-gate|--disable-review-gate] [--json]",
+      "  node scripts/codex-companion.mjs review [--host <id>] [--backend <id>] [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
+      "  node scripts/codex-companion.mjs adversarial-review [--host <id>] [--backend <id>] [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs task [--host <id>] [--backend <id>] [--background] [--write] [--resume-last|--resume|--fresh] [--model <model>] [--effort <value>] [prompt]",
+      "  node scripts/codex-companion.mjs transfer [--host <id>] [--backend <id>] [--source <session-export>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
     ].join("\n")
   );
+}
+
+function buildAdapterReport() {
+  return {
+    hosts: listHostAdapters().map(({ id, displayName, capabilities }) => ({ id, displayName, capabilities })),
+    backends: listBackendAdapters().map(({ id, displayName, capabilities }) => ({ id, displayName, capabilities }))
+  };
+}
+
+function renderAdapterReport(report) {
+  const lines = ["# Agent Bridge Adapters", "", "Hosts:"];
+  for (const host of report.hosts) {
+    lines.push(`- ${host.id}: ${host.displayName}`);
+  }
+  lines.push("", "Backends:");
+  for (const backend of report.backends) {
+    const capabilities = Object.entries(backend.capabilities)
+      .filter(([, enabled]) => enabled)
+      .map(([name]) => name)
+      .join(", ");
+    lines.push(`- ${backend.id}: ${backend.displayName} (${capabilities})`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function handleAdapters(argv) {
+  const { options } = parseCommandInput(argv, {
+    booleanOptions: ["json"]
+  });
+  const report = buildAdapterReport();
+  outputCommandResult(report, renderAdapterReport(report), options.json);
 }
 
 function outputResult(value, asJson) {
@@ -98,33 +114,6 @@ function outputResult(value, asJson) {
 
 function outputCommandResult(payload, rendered, asJson) {
   outputResult(asJson ? payload : rendered, asJson);
-}
-
-function normalizeRequestedModel(model) {
-  if (model == null) {
-    return null;
-  }
-  const normalized = String(model).trim();
-  if (!normalized) {
-    return null;
-  }
-  return MODEL_ALIASES.get(normalized.toLowerCase()) ?? normalized;
-}
-
-function normalizeReasoningEffort(effort) {
-  if (effort == null) {
-    return null;
-  }
-  const normalized = String(effort).trim().toLowerCase();
-  if (!normalized) {
-    return null;
-  }
-  if (!VALID_REASONING_EFFORTS.has(normalized)) {
-    throw new Error(
-      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh.`
-    );
-  }
-  return normalized;
 }
 
 function normalizeArgv(argv) {
@@ -179,34 +168,42 @@ function firstMeaningfulLine(text, fallback) {
   return line ?? fallback;
 }
 
-async function buildSetupReport(cwd, actionsTaken = []) {
+async function buildSetupReport(cwd, actionsTaken = [], context = resolveBridgeContext()) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const nodeStatus = binaryAvailable("node", ["--version"], { cwd });
   const npmStatus = binaryAvailable("npm", ["--version"], { cwd });
-  const codexStatus = getCodexAvailability(cwd);
-  const authStatus = await getCodexAuthStatus(cwd);
+  const backendStatus = context.backend.getAvailability(cwd);
+  const authStatus = await context.backend.getAuthStatus(cwd);
   const config = getConfig(workspaceRoot);
 
   const nextSteps = [];
-  if (!codexStatus.available) {
-    nextSteps.push("Install Codex with `npm install -g @openai/codex`.");
+  if (!backendStatus.available) {
+    nextSteps.push(`Install ${context.backend.displayName} with \`${context.backend.setup.installCommand}\`.`);
   }
-  if (codexStatus.available && !authStatus.loggedIn && authStatus.requiresOpenaiAuth) {
-    nextSteps.push("Run `!codex login`.");
-    nextSteps.push("If browser login is blocked, retry with `!codex login --device-auth` or `!codex login --with-api-key`.");
+  if (backendStatus.available && !authStatus.loggedIn && authStatus.required) {
+    nextSteps.push(`Run \`!${context.backend.setup.loginCommand}\`.`);
+    nextSteps.push(
+      `If browser login is blocked, retry with \`!${context.backend.setup.deviceLoginCommand}\` or \`!${context.backend.setup.apiKeyLoginCommand}\`.`
+    );
   }
   if (!config.stopReviewGate) {
-    nextSteps.push("Optional: run `/codex:setup --enable-review-gate` to require a fresh review before stop.");
+    nextSteps.push(
+      `Optional: run \`/codex:setup --backend ${context.backend.id} --enable-review-gate\` to require a fresh review before stop.`
+    );
   }
 
   return {
-    ready: nodeStatus.available && codexStatus.available && authStatus.loggedIn,
+    ready: nodeStatus.available && backendStatus.available && authStatus.loggedIn,
+    host: { id: context.host.id, displayName: context.host.displayName },
+    backend: { id: context.backend.id, displayName: context.backend.displayName },
     node: nodeStatus,
     npm: npmStatus,
-    codex: codexStatus,
+    backendStatus,
+    ...(context.backend.id === "codex" ? { codex: backendStatus } : {}),
     auth: authStatus,
-    sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
+    sessionRuntime: context.backend.getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
+    reviewGateBackendId: config.stopReviewBackendId ?? "codex",
     actionsTaken,
     nextSteps
   };
@@ -214,7 +211,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 
 async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
+    valueOptions: ["cwd", "host", "backend"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
   });
 
@@ -223,18 +220,20 @@ async function handleSetup(argv) {
   }
 
   const cwd = resolveCommandCwd(options);
+  const context = resolveBridgeContext(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const actionsTaken = [];
 
   if (options["enable-review-gate"]) {
     setConfig(workspaceRoot, "stopReviewGate", true);
-    actionsTaken.push(`Enabled the stop-time review gate for ${workspaceRoot}.`);
+    setConfig(workspaceRoot, "stopReviewBackendId", context.backend.id);
+    actionsTaken.push(`Enabled the ${context.backend.displayName} stop-time review gate for ${workspaceRoot}.`);
   } else if (options["disable-review-gate"]) {
     setConfig(workspaceRoot, "stopReviewGate", false);
     actionsTaken.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
   }
 
-  const finalReport = await buildSetupReport(cwd, actionsTaken);
+  const finalReport = await buildSetupReport(cwd, actionsTaken, context);
   outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
 }
 
@@ -249,10 +248,12 @@ function buildAdversarialReviewPrompt(context, focusText) {
   });
 }
 
-function ensureCodexAvailable(cwd) {
-  const availability = getCodexAvailability(cwd);
+function ensureBackendAvailable(cwd, context) {
+  const availability = context.backend.getAvailability(cwd);
   if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
+    throw new Error(
+      `${context.backend.displayName} is not installed or is missing required runtime support. Install it with \`${context.backend.setup.installCommand}\`, then rerun setup.`
+    );
   }
 }
 
@@ -291,16 +292,21 @@ function isActiveJobStatus(status) {
   return status === "queued" || status === "running";
 }
 
-function getCurrentClaudeSessionId() {
-  return process.env[SESSION_ID_ENV] ?? null;
+function getCurrentHostSessionId(context) {
+  return context.host.getSessionId(process.env);
 }
 
-function filterJobsForCurrentClaudeSession(jobs) {
-  const sessionId = getCurrentClaudeSessionId();
+function filterJobsForBridgeContext(jobs, context) {
+  const sessionId = getCurrentHostSessionId(context);
+  const scopedJobs = jobs.filter(
+    (job) =>
+      (job.hostId == null || job.hostId === context.host.id) &&
+      (job.backendId == null || job.backendId === context.backend.id)
+  );
   if (!sessionId) {
-    return jobs;
+    return scopedJobs;
   }
-  return jobs.filter((job) => job.sessionId === sessionId);
+  return scopedJobs.filter((job) => job.sessionId === sessionId);
 }
 
 function findLatestResumableTaskJob(jobs) {
@@ -333,11 +339,11 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   };
 }
 
-async function resolveLatestTrackedTaskThread(cwd, options = {}) {
+async function resolveLatestTrackedTaskThread(cwd, context, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const sessionId = getCurrentClaudeSessionId();
+  const sessionId = getCurrentHostSessionId(context);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
-  const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
+  const visibleJobs = filterJobsForBridgeContext(jobs, context);
   const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
   if (activeTask) {
     throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
@@ -352,11 +358,13 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
     return null;
   }
 
-  return findLatestTaskThread(workspaceRoot);
+  return context.backend.findLatestTaskThread(workspaceRoot);
 }
 
 async function executeReviewRun(request) {
-  ensureCodexAvailable(request.cwd);
+  const bridge = request.bridgeContext ?? resolveBridgeContext({ host: request.hostId, backend: request.backendId });
+  assertBridgeCapability(bridge, "review");
+  ensureBackendAvailable(request.cwd, bridge);
   ensureGitRepository(request.cwd);
 
   const target = resolveReviewTarget(request.cwd, {
@@ -367,22 +375,26 @@ async function executeReviewRun(request) {
   const reviewName = request.reviewName ?? "Review";
   if (reviewName === "Review") {
     const reviewTarget = validateNativeReviewRequest(target, focusText);
-    const result = await runAppServerReview(request.cwd, {
+    const result = await bridge.backend.runReview(request.cwd, {
       target: reviewTarget,
       model: request.model,
       onProgress: request.onProgress
     });
+    const agentResult = {
+      status: result.status,
+      stderr: result.stderr,
+      stdout: result.reviewText,
+      reasoning: result.reasoningSummary
+    };
     const payload = {
       review: reviewName,
       target,
       threadId: result.threadId,
       sourceThreadId: result.sourceThreadId,
-      codex: {
-        status: result.status,
-        stderr: result.stderr,
-        stdout: result.reviewText,
-        reasoning: result.reasoningSummary
-      }
+      hostId: bridge.host.id,
+      backendId: bridge.backend.id,
+      agent: agentResult,
+      ...(bridge.backend.id === "codex" ? { codex: agentResult } : {})
     };
     const rendered = renderNativeReviewResult(
       {
@@ -390,7 +402,12 @@ async function executeReviewRun(request) {
         stdout: result.reviewText,
         stderr: result.stderr
       },
-      { reviewLabel: reviewName, targetLabel: target.label, reasoningSummary: result.reasoningSummary }
+      {
+        reviewLabel: reviewName,
+        targetLabel: target.label,
+        reasoningSummary: result.reasoningSummary,
+        backendLabel: bridge.backend.displayName
+      }
     );
 
     return {
@@ -400,22 +417,22 @@ async function executeReviewRun(request) {
       payload,
       rendered,
       summary: firstMeaningfulLine(result.reviewText, `${reviewName} completed.`),
-      jobTitle: `Codex ${reviewName}`,
+      jobTitle: `${bridge.backend.displayName} ${reviewName}`,
       jobClass: "review",
       targetLabel: target.label
     };
   }
 
-  const context = collectReviewContext(request.cwd, target);
-  const prompt = buildAdversarialReviewPrompt(context, focusText);
-  const result = await runAppServerTurn(context.repoRoot, {
+  const reviewContext = collectReviewContext(request.cwd, target);
+  const prompt = buildAdversarialReviewPrompt(reviewContext, focusText);
+  const result = await bridge.backend.runTask(reviewContext.repoRoot, {
     prompt,
     model: request.model,
     sandbox: "read-only",
-    outputSchema: readOutputSchema(REVIEW_SCHEMA),
+    outputSchema: bridge.backend.readOutputSchema(REVIEW_SCHEMA),
     onProgress: request.onProgress
   });
-  const parsed = parseStructuredOutput(result.finalMessage, {
+  const parsed = bridge.backend.parseStructuredOutput(result.finalMessage, {
     status: result.status,
     failureMessage: result.error?.message ?? result.stderr
   });
@@ -424,16 +441,28 @@ async function executeReviewRun(request) {
     target,
     threadId: result.threadId,
     context: {
-      repoRoot: context.repoRoot,
-      branch: context.branch,
-      summary: context.summary
+      repoRoot: reviewContext.repoRoot,
+      branch: reviewContext.branch,
+      summary: reviewContext.summary
     },
-    codex: {
+    hostId: bridge.host.id,
+    backendId: bridge.backend.id,
+    agent: {
       status: result.status,
       stderr: result.stderr,
       stdout: result.finalMessage,
       reasoning: result.reasoningSummary
     },
+    ...(bridge.backend.id === "codex"
+      ? {
+          codex: {
+            status: result.status,
+            stderr: result.stderr,
+            stdout: result.finalMessage,
+            reasoning: result.reasoningSummary
+          }
+        }
+      : {}),
     result: parsed.parsed,
     rawOutput: parsed.rawOutput,
     parseError: parsed.parseError,
@@ -447,33 +476,37 @@ async function executeReviewRun(request) {
     payload,
     rendered: renderReviewResult(parsed, {
       reviewLabel: reviewName,
-      targetLabel: context.target.label,
-      reasoningSummary: result.reasoningSummary
+      targetLabel: reviewContext.target.label,
+      reasoningSummary: result.reasoningSummary,
+      backendLabel: bridge.backend.displayName
     }),
     summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
-    jobTitle: `Codex ${reviewName}`,
+    jobTitle: `${bridge.backend.displayName} ${reviewName}`,
     jobClass: "review",
-    targetLabel: context.target.label
+    targetLabel: reviewContext.target.label
   };
 }
 
 
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
-  ensureCodexAvailable(request.cwd);
+  const bridge = request.bridgeContext ?? resolveBridgeContext({ host: request.hostId, backend: request.backendId });
+  assertBridgeCapability(bridge, "task");
+  ensureBackendAvailable(request.cwd, bridge);
 
   const taskMetadata = buildTaskRunMetadata({
     prompt: request.prompt,
-    resumeLast: request.resumeLast
+    resumeLast: request.resumeLast,
+    bridge
   });
 
   let resumeThreadId = null;
   if (request.resumeLast) {
-    const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
+    const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, bridge, {
       excludeJobId: request.jobId
     });
     if (!latestThread) {
-      throw new Error("No previous Codex task thread was found for this repository.");
+      throw new Error(`No previous ${bridge.backend.displayName} task thread was found for this repository.`);
     }
     resumeThreadId = latestThread.id;
   }
@@ -482,16 +515,18 @@ async function executeTaskRun(request) {
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
   }
 
-  const result = await runAppServerTurn(workspaceRoot, {
+  const result = await bridge.backend.runTask(workspaceRoot, {
     resumeThreadId,
     prompt: request.prompt,
-    defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
+    defaultPrompt: resumeThreadId ? bridge.backend.defaultContinuePrompt : "",
     model: request.model,
     effort: request.effort,
     sandbox: request.write ? "workspace-write" : "read-only",
     onProgress: request.onProgress,
     persistThread: true,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
+    threadName: resumeThreadId
+      ? null
+      : bridge.backend.buildTaskThreadName(request.prompt || bridge.backend.defaultContinuePrompt)
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
@@ -505,12 +540,15 @@ async function executeTaskRun(request) {
     {
       title: taskMetadata.title,
       jobId: request.jobId ?? null,
-      write: Boolean(request.write)
+      write: Boolean(request.write),
+      backendLabel: bridge.backend.displayName
     }
   );
   const payload = {
     status: result.status,
     threadId: result.threadId,
+    hostId: bridge.host.id,
+    backendId: bridge.backend.id,
     rawOutput,
     touchedFiles: result.touchedFiles,
     reasoningSummary: result.reasoningSummary
@@ -529,24 +567,28 @@ async function executeTaskRun(request) {
   };
 }
 
-function buildReviewJobMetadata(reviewName, target) {
+function buildReviewJobMetadata(reviewName, target, bridge) {
   return {
     kind: reviewName === "Adversarial Review" ? "adversarial-review" : "review",
-    title: reviewName === "Review" ? "Codex Review" : `Codex ${reviewName}`,
+    title: reviewName === "Review" ? `${bridge.backend.displayName} Review` : `${bridge.backend.displayName} ${reviewName}`,
     summary: `${reviewName} ${target.label}`
   };
 }
 
-function buildTaskRunMetadata({ prompt, resumeLast = false }) {
-  if (!resumeLast && String(prompt ?? "").includes(STOP_REVIEW_TASK_MARKER)) {
+function buildTaskRunMetadata({ prompt, resumeLast = false, bridge = resolveBridgeContext() }) {
+  if (
+    !resumeLast &&
+    bridge.host.stopReviewTaskMarker &&
+    String(prompt ?? "").includes(bridge.host.stopReviewTaskMarker)
+  ) {
     return {
-      title: "Codex Stop Gate Review",
-      summary: "Stop-gate review of previous Claude turn"
+      title: `${bridge.backend.displayName} Stop Gate Review`,
+      summary: `Stop-gate review of previous ${bridge.host.displayName} turn`
     };
   }
 
-  const title = resumeLast ? "Codex Resume" : "Codex Task";
-  const fallbackSummary = resumeLast ? DEFAULT_CONTINUE_PROMPT : "Task";
+  const title = resumeLast ? `${bridge.backend.displayName} Resume` : `${bridge.backend.displayName} Task`;
+  const fallbackSummary = resumeLast ? bridge.backend.defaultContinuePrompt : "Task";
   return {
     title,
     summary: shorten(prompt || fallbackSummary)
@@ -564,17 +606,22 @@ function getJobKindLabel(kind, jobClass) {
   return jobClass === "review" ? "review" : "rescue";
 }
 
-function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false }) {
-  return createJobRecord({
-    id: generateJobId(prefix),
-    kind,
-    kindLabel: getJobKindLabel(kind, jobClass),
-    title,
-    workspaceRoot,
-    jobClass,
-    summary,
-    write
-  });
+function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, bridge, write = false }) {
+  return createJobRecord(
+    {
+      id: generateJobId(prefix),
+      kind,
+      kindLabel: getJobKindLabel(kind, jobClass),
+      title,
+      workspaceRoot,
+      jobClass,
+      summary,
+      hostId: bridge.host.id,
+      backendId: bridge.backend.id,
+      write
+    },
+    { sessionId: bridge.sessionId }
+  );
 }
 
 function createTrackedProgress(job, options = {}) {
@@ -589,7 +636,7 @@ function createTrackedProgress(job, options = {}) {
   };
 }
 
-function buildTaskJob(workspaceRoot, taskMetadata, write) {
+function buildTaskJob(workspaceRoot, taskMetadata, bridge, write) {
   return createCompanionJob({
     prefix: "task",
     kind: "task",
@@ -597,11 +644,12 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
     workspaceRoot,
     jobClass: "task",
     summary: taskMetadata.summary,
+    bridge,
     write
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId, bridge }) {
   return {
     cwd,
     model,
@@ -609,34 +657,46 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     prompt,
     write,
     resumeLast,
-    jobId
+    jobId,
+    hostId: bridge.host.id,
+    backendId: bridge.backend.id
   };
 }
 
-function renderTransferResult(payload) {
+function renderTransferResult(payload, bridge) {
   const lines = [
-    "Transferred the Claude session into a Codex thread with visible turn history.",
-    `Codex session ID: ${payload.threadId}`,
-    `Resume in Codex: ${payload.resumeCommand}`
+    `Transferred the ${bridge.host.displayName} session into a ${bridge.backend.displayName} thread with visible turn history.`,
+    `${bridge.backend.sessionLabel}: ${payload.threadId}`,
+    `Resume in ${bridge.backend.displayName}: ${payload.resumeCommand}`
   ];
   return `${lines.join("\n")}\n`;
 }
 
-async function executeTransfer(cwd, options = {}) {
-  const sourcePath = resolveClaudeSessionPath(cwd, {
-    source: options.source
+async function executeTransfer(cwd, bridge, options = {}) {
+  assertBridgeCapability(bridge, "sessionImport");
+  if (!bridge.host.capabilities.sessionExport) {
+    throw new Error(`${bridge.host.displayName} does not support session export.`);
+  }
+  const sessionExport = bridge.host.resolveSessionExport(cwd, {
+    source: options.source,
+    sessionId: bridge.sessionId
   });
-  const result = await importExternalAgentSession(cwd, { sourcePath });
+  const result = await bridge.backend.importSession(cwd, {
+    sourcePath: sessionExport.sourcePath,
+    sourceFormat: sessionExport.format
+  });
   const payload = {
     threadId: result.threadId,
-    resumeCommand: `codex resume ${result.threadId}`,
-    sourcePath,
-    sessionId: path.basename(sourcePath, ".jsonl")
+    resumeCommand: bridge.backend.formatResumeCommand(result.threadId),
+    sourcePath: sessionExport.sourcePath,
+    sessionId: sessionExport.sourceSessionId ?? path.basename(sessionExport.sourcePath, ".jsonl"),
+    hostId: bridge.host.id,
+    backendId: bridge.backend.id
   };
 
   return {
     payload,
-    rendered: renderTransferResult(payload)
+    rendered: renderTransferResult(payload, bridge)
   };
 }
 
@@ -711,7 +771,7 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "host", "backend"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -719,6 +779,7 @@ async function handleReviewCommand(argv, config) {
   });
 
   const cwd = resolveCommandCwd(options);
+  const bridge = resolveBridgeContext(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const focusText = positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, {
@@ -727,14 +788,15 @@ async function handleReviewCommand(argv, config) {
   });
 
   config.validateRequest?.(target, focusText);
-  const metadata = buildReviewJobMetadata(config.reviewName, target);
+  const metadata = buildReviewJobMetadata(config.reviewName, target, bridge);
   const job = createCompanionJob({
     prefix: "review",
     kind: metadata.kind,
     title: metadata.title,
     workspaceRoot,
     jobClass: "review",
-    summary: metadata.summary
+    summary: metadata.summary,
+    bridge
   });
   await runForegroundCommand(
     job,
@@ -743,9 +805,10 @@ async function handleReviewCommand(argv, config) {
         cwd,
         base: options.base,
         scope: options.scope,
-        model: options.model,
+        model: bridge.backend.normalizeModel(options.model),
         focusText,
         reviewName: config.reviewName,
+        bridgeContext: bridge,
         onProgress: progress
       }),
     { json: options.json }
@@ -761,7 +824,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "host", "backend"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -769,9 +832,10 @@ async function handleTask(argv) {
   });
 
   const cwd = resolveCommandCwd(options);
+  const bridge = resolveBridgeContext(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const model = normalizeRequestedModel(options.model);
-  const effort = normalizeReasoningEffort(options.effort);
+  const model = bridge.backend.normalizeModel(options.model);
+  const effort = bridge.backend.normalizeReasoningEffort(options.effort);
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
@@ -782,14 +846,16 @@ async function handleTask(argv) {
   const write = Boolean(options.write);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
-    resumeLast
+    resumeLast,
+    bridge
   });
 
   if (options.background) {
-    ensureCodexAvailable(cwd);
+    assertBridgeCapability(bridge, "task");
+    ensureBackendAvailable(cwd, bridge);
     requireTaskRequest(prompt, resumeLast);
 
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+    const job = buildTaskJob(workspaceRoot, taskMetadata, bridge, write);
     const request = buildTaskRequest({
       cwd,
       model,
@@ -797,14 +863,15 @@ async function handleTask(argv) {
       prompt,
       write,
       resumeLast,
-      jobId: job.id
+      jobId: job.id,
+      bridge
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const job = buildTaskJob(workspaceRoot, taskMetadata, bridge, write);
   await runForegroundCommand(
     job,
     (progress) =>
@@ -816,6 +883,7 @@ async function handleTask(argv) {
         write,
         resumeLast,
         jobId: job.id,
+        bridgeContext: bridge,
         onProgress: progress
       }),
     { json: options.json }
@@ -824,12 +892,13 @@ async function handleTask(argv) {
 
 async function handleTransfer(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "source"],
+    valueOptions: ["cwd", "source", "host", "backend"],
     booleanOptions: ["json"]
   });
 
   const cwd = resolveCommandCwd(options);
-  const { payload, rendered } = await executeTransfer(cwd, {
+  const bridge = resolveBridgeContext(options);
+  const { payload, rendered } = await executeTransfer(cwd, bridge, {
     source: options.source
   });
   outputCommandResult(payload, rendered, options.json);
@@ -882,11 +951,12 @@ async function handleTaskWorker(argv) {
 
 async function handleStatus(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
+    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms", "host", "backend"],
     booleanOptions: ["json", "all", "wait"]
   });
 
   const cwd = resolveCommandCwd(options);
+  const bridge = resolveBridgeContext(options);
   const reference = positionals[0] ?? "";
   if (reference) {
     const snapshot = options.wait
@@ -903,19 +973,30 @@ async function handleStatus(argv) {
     throw new Error("`status --wait` requires a job id.");
   }
 
-  const report = buildStatusSnapshot(cwd, { all: options.all });
+  const report = buildStatusSnapshot(cwd, {
+    all: options.all,
+    hostId: bridge.host.id,
+    backendId: bridge.backend.id,
+    sessionId: bridge.sessionId,
+    sessionRuntime: bridge.backend.getSessionRuntimeStatus(process.env, cwd)
+  });
   outputResult(renderStatusPayload(report, options.json), options.json);
 }
 
 function handleResult(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
+    valueOptions: ["cwd", "host", "backend"],
     booleanOptions: ["json"]
   });
 
   const cwd = resolveCommandCwd(options);
+  const bridge = resolveBridgeContext(options);
   const reference = positionals[0] ?? "";
-  const { workspaceRoot, job } = resolveResultJob(cwd, reference);
+  const { workspaceRoot, job } = resolveResultJob(cwd, reference, {
+    hostId: bridge.host.id,
+    backendId: bridge.backend.id,
+    sessionId: bridge.sessionId
+  });
   const storedJob = readStoredJob(workspaceRoot, job.id);
   const payload = {
     job,
@@ -927,14 +1008,15 @@ function handleResult(argv) {
 
 function handleTaskResumeCandidate(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
+    valueOptions: ["cwd", "host", "backend"],
     booleanOptions: ["json"]
   });
 
   const cwd = resolveCommandCwd(options);
+  const bridge = resolveBridgeContext(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const sessionId = getCurrentClaudeSessionId();
-  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
+  const sessionId = getCurrentHostSessionId(bridge);
+  const jobs = filterJobsForBridgeContext(sortJobsNewestFirst(listJobs(workspaceRoot)), bridge);
   const candidate = findLatestResumableTaskJob(jobs);
 
   const payload = {
@@ -962,24 +1044,32 @@ function handleTaskResumeCandidate(argv) {
 
 async function handleCancel(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
+    valueOptions: ["cwd", "host", "backend"],
     booleanOptions: ["json"]
   });
 
   const cwd = resolveCommandCwd(options);
+  const bridge = resolveBridgeContext(options);
   const reference = positionals[0] ?? "";
-  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
+  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, {
+    hostId: bridge.host.id,
+    backendId: bridge.backend.id,
+    sessionId: bridge.sessionId
+  });
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  const jobBackend = resolveBackendForJob(job);
+  const interrupt = jobBackend.capabilities.interrupt
+    ? await jobBackend.interruptTurn(cwd, { threadId, turnId })
+    : { attempted: false, interrupted: false, detail: null };
   if (interrupt.attempted) {
     appendLogLine(
       job.logFile,
       interrupt.interrupted
-        ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
-        : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
+        ? `Requested ${jobBackend.displayName} turn interrupt for ${turnId} on ${threadId}.`
+        : `${jobBackend.displayName} turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
     );
   }
 
@@ -1029,6 +1119,9 @@ async function main() {
   }
 
   switch (subcommand) {
+    case "adapters":
+      handleAdapters(argv);
+      break;
     case "setup":
       await handleSetup(argv);
       break;

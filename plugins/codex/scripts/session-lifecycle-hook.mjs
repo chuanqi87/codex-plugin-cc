@@ -16,6 +16,7 @@ import {
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import { BRIDGE_BACKEND_ENV, BRIDGE_HOST_ENV, BRIDGE_SESSION_ID_ENV } from "./lib/bridge-env.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
@@ -51,7 +52,9 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 
   const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
+  const removedJobs = state.jobs.filter(
+    (job) => job.sessionId === sessionId && (job.hostId == null || job.hostId === "claude-code")
+  );
   if (removedJobs.length === 0) {
     return;
   }
@@ -70,12 +73,17 @@ function cleanupSessionJobs(cwd, sessionId) {
 
   saveState(workspaceRoot, {
     ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+    jobs: state.jobs.filter(
+      (job) => job.sessionId !== sessionId || (job.hostId != null && job.hostId !== "claude-code")
+    )
   });
 }
 
 function handleSessionStart(input) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
+  appendEnvVar(BRIDGE_SESSION_ID_ENV, input.session_id);
+  appendEnvVar(BRIDGE_HOST_ENV, "claude-code");
+  appendEnvVar(BRIDGE_BACKEND_ENV, "codex");
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
 }

@@ -2,6 +2,17 @@
 
 Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
 
+The runtime now uses explicit host and backend adapters. Claude Code + Codex remains the default
+pairing, and OpenCode is available as an experimental execution backend.
+See [Agent Bridge architecture](docs/agent-bridge-architecture.md) for the extension model and the
+OpenCode/Qoder integration sequence.
+
+To inspect the currently installed adapter matrix:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adapters
+```
+
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
 they already have.
 
@@ -161,6 +172,21 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
+
+#### Experimental OpenCode backend
+
+If OpenCode is installed, task and review commands can select it explicitly:
+
+```bash
+/codex:setup --backend opencode
+/codex:review --backend opencode
+/codex:rescue --backend opencode investigate why the tests started failing
+/codex:rescue --backend opencode --resume continue with the safest fix
+```
+
+OpenCode supports task execution, review, background jobs, result retrieval, cancellation, and session
+resume through this bridge. Claude transcript transfer is not supported for OpenCode. Model values are
+passed through in OpenCode's `provider/model` form, and `--effort` maps to its model variant.
 
 ### `/codex:transfer`
 

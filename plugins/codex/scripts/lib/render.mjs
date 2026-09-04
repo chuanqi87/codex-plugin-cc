@@ -1,3 +1,5 @@
+import { resolveBackendForJob } from "./backend-adapters.mjs";
+
 function severityRank(severity) {
   switch (severity) {
     case "critical":
@@ -99,16 +101,19 @@ function escapeMarkdownCell(value) {
     .trim();
 }
 
-function formatCodexResumeCommand(job) {
+function formatResumeCommand(job) {
   if (!job?.threadId) {
     return null;
   }
-  return `codex resume ${job.threadId}`;
+  if (job.resumeCommand) {
+    return job.resumeCommand;
+  }
+  return resolveBackendForJob(job).formatResumeCommand(job.threadId);
 }
 
-function appendActiveJobsTable(lines, jobs) {
+function appendActiveJobsTable(lines, jobs, sessionLabel = "Agent Session ID") {
   lines.push("Active jobs:");
-  lines.push("| Job | Kind | Status | Phase | Elapsed | Codex Session ID | Summary | Actions |");
+  lines.push(`| Job | Kind | Status | Phase | Elapsed | ${sessionLabel} | Summary | Actions |`);
   lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const job of jobs) {
     const actions = [`/codex:status ${job.id}`];
@@ -136,11 +141,11 @@ function pushJobDetails(lines, job, options = {}) {
     lines.push(`  Duration: ${job.duration}`);
   }
   if (job.threadId) {
-    lines.push(`  Codex session ID: ${job.threadId}`);
+    lines.push(`  ${job.backendSessionLabel ?? "Codex session ID"}: ${job.threadId}`);
   }
-  const resumeCommand = formatCodexResumeCommand(job);
+  const resumeCommand = formatResumeCommand(job);
   if (resumeCommand) {
-    lines.push(`  Resume in Codex: ${resumeCommand}`);
+    lines.push(`  Resume in ${job.backendDisplayName ?? "Codex"}: ${resumeCommand}`);
   }
   if (job.logFile && options.showLog) {
     lines.push(`  Log: ${job.logFile}`);
@@ -175,18 +180,20 @@ function appendReasoningSection(lines, reasoningSummary) {
 }
 
 export function renderSetupReport(report) {
+  const backendName = report.backend?.displayName ?? "Codex";
+  const backendStatus = report.backendStatus ?? report.codex;
   const lines = [
-    "# Codex Setup",
+    `# ${backendName} Setup`,
     "",
     `Status: ${report.ready ? "ready" : "needs attention"}`,
     "",
     "Checks:",
     `- node: ${report.node.detail}`,
     `- npm: ${report.npm.detail}`,
-    `- codex: ${report.codex.detail}`,
+    `- ${backendName.toLowerCase()}: ${backendStatus.detail}`,
     `- auth: ${report.auth.detail}`,
     `- session runtime: ${report.sessionRuntime.label}`,
-    `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
+    `- review gate: ${report.reviewGateEnabled ? `enabled (${report.reviewGateBackendId ?? "codex"})` : "disabled"}`,
     ""
   ];
 
@@ -209,11 +216,12 @@ export function renderSetupReport(report) {
 }
 
 export function renderReviewResult(parsedResult, meta) {
+  const backendName = meta.backendLabel ?? "Codex";
   if (!parsedResult.parsed) {
     const lines = [
-      `# Codex ${meta.reviewLabel}`,
+      `# ${backendName} ${meta.reviewLabel}`,
       "",
-      "Codex did not return valid structured JSON.",
+      `${backendName} did not return valid structured JSON.`,
       "",
       `- Parse error: ${parsedResult.parseError}`
     ];
@@ -230,10 +238,10 @@ export function renderReviewResult(parsedResult, meta) {
   const validationError = validateReviewResultShape(parsedResult.parsed);
   if (validationError) {
     const lines = [
-      `# Codex ${meta.reviewLabel}`,
+      `# ${backendName} ${meta.reviewLabel}`,
       "",
       `Target: ${meta.targetLabel}`,
-      "Codex returned JSON with an unexpected review shape.",
+      `${backendName} returned JSON with an unexpected review shape.`,
       "",
       `- Validation error: ${validationError}`
     ];
@@ -250,7 +258,7 @@ export function renderReviewResult(parsedResult, meta) {
   const data = normalizeReviewResultData(parsedResult.parsed);
   const findings = [...data.findings].sort((left, right) => severityRank(left.severity) - severityRank(right.severity));
   const lines = [
-    `# Codex ${meta.reviewLabel}`,
+    `# ${backendName} ${meta.reviewLabel}`,
     "",
     `Target: ${meta.targetLabel}`,
     `Verdict: ${data.verdict}`,
@@ -286,10 +294,11 @@ export function renderReviewResult(parsedResult, meta) {
 }
 
 export function renderNativeReviewResult(result, meta) {
+  const backendName = meta.backendLabel ?? "Codex";
   const stdout = result.stdout.trim();
   const stderr = result.stderr.trim();
   const lines = [
-    `# Codex ${meta.reviewLabel}`,
+    `# ${backendName} ${meta.reviewLabel}`,
     "",
     `Target: ${meta.targetLabel}`,
     ""
@@ -298,9 +307,9 @@ export function renderNativeReviewResult(result, meta) {
   if (stdout) {
     lines.push(stdout);
   } else if (result.status === 0) {
-    lines.push("Codex review completed without any stdout output.");
+    lines.push(`${backendName} review completed without any stdout output.`);
   } else {
-    lines.push("Codex review failed.");
+    lines.push(`${backendName} review failed.`);
   }
 
   if (stderr) {
@@ -318,21 +327,23 @@ export function renderTaskResult(parsedResult, meta) {
     return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
   }
 
-  const message = String(parsedResult?.failureMessage ?? "").trim() || "Codex did not return a final message.";
+  const message =
+    String(parsedResult?.failureMessage ?? "").trim() || `${meta.backendLabel ?? "Codex"} did not return a final message.`;
   return `${message}\n`;
 }
 
 export function renderStatusReport(report) {
+  const backendName = report.backend?.displayName ?? "Codex";
   const lines = [
-    "# Codex Status",
+    `# ${backendName} Status`,
     "",
     `Session runtime: ${report.sessionRuntime.label}`,
-    `Review gate: ${report.config.stopReviewGate ? "enabled" : "disabled"}`,
+    `Review gate: ${report.config.stopReviewGate ? `enabled (${report.config.stopReviewBackendId ?? "codex"})` : "disabled"}`,
     ""
   ];
 
   if (report.running.length > 0) {
-    appendActiveJobsTable(lines, report.running);
+    appendActiveJobsTable(lines, report.running, report.backend?.sessionColumnLabel ?? "Codex Session ID");
     lines.push("");
     lines.push("Live details:");
     for (const job of report.running) {
@@ -368,14 +379,14 @@ export function renderStatusReport(report) {
 
   if (report.needsReview) {
     lines.push("The stop-time review gate is enabled.");
-    lines.push("Ending the session will trigger a fresh Codex adversarial review and block if it finds issues.");
+    lines.push(`Ending the session will trigger a fresh ${backendName} adversarial review and block if it finds issues.`);
   }
 
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
 export function renderJobStatusReport(job) {
-  const lines = ["# Codex Job Status", ""];
+  const lines = [`# ${job.backendDisplayName ?? "Codex"} Job Status`, ""];
   pushJobDetails(lines, job, {
     showElapsed: job.status === "queued" || job.status === "running",
     showDuration: job.status !== "queued" && job.status !== "running",
@@ -388,18 +399,21 @@ export function renderJobStatusReport(job) {
 }
 
 export function renderStoredJobResult(job, storedJob) {
+  const backend = resolveBackendForJob(storedJob ?? job);
+  const backendName = backend.displayName;
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
-  const resumeCommand = threadId ? `codex resume ${threadId}` : null;
+  const resumeCommand = threadId ? backend.formatResumeCommand(threadId) : null;
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
     if (!threadId) {
       return output;
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return `${output}\n${backend.sessionLabel}: ${threadId}\nResume in ${backendName}: ${resumeCommand}\n`;
   }
 
   const rawOutput =
     (typeof storedJob?.result?.rawOutput === "string" && storedJob.result.rawOutput) ||
+    (typeof storedJob?.result?.agent?.stdout === "string" && storedJob.result.agent.stdout) ||
     (typeof storedJob?.result?.codex?.stdout === "string" && storedJob.result.codex.stdout) ||
     "";
   if (rawOutput) {
@@ -407,7 +421,7 @@ export function renderStoredJobResult(job, storedJob) {
     if (!threadId) {
       return output;
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return `${output}\n${backend.sessionLabel}: ${threadId}\nResume in ${backendName}: ${resumeCommand}\n`;
   }
 
   if (storedJob?.rendered) {
@@ -415,19 +429,19 @@ export function renderStoredJobResult(job, storedJob) {
     if (!threadId) {
       return output;
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return `${output}\n${backend.sessionLabel}: ${threadId}\nResume in ${backendName}: ${resumeCommand}\n`;
   }
 
   const lines = [
-    `# ${job.title ?? "Codex Result"}`,
+    `# ${job.title ?? `${backendName} Result`}`,
     "",
     `Job: ${job.id}`,
     `Status: ${job.status}`
   ];
 
   if (threadId) {
-    lines.push(`Codex session ID: ${threadId}`);
-    lines.push(`Resume in Codex: ${resumeCommand}`);
+    lines.push(`${backend.sessionLabel}: ${threadId}`);
+    lines.push(`Resume in ${backendName}: ${resumeCommand}`);
   }
 
   if (job.summary) {
@@ -446,8 +460,9 @@ export function renderStoredJobResult(job, storedJob) {
 }
 
 export function renderCancelReport(job) {
+  const backendName = job.backendDisplayName ?? resolveBackendForJob(job).displayName;
   const lines = [
-    "# Codex Cancel",
+    `# ${backendName} Cancel`,
     "",
     `Cancelled ${job.id}.`,
     ""

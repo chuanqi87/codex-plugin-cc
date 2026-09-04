@@ -1,6 +1,6 @@
 ---
-description: Cancel an active background Codex job in this repository
-argument-hint: '[job-id]'
+description: Cancel an active background bridge job in this repository
+argument-hint: '[job-id] [--backend codex|opencode]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---

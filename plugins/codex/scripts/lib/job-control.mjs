@@ -1,6 +1,6 @@
 import fs from "node:fs";
 
-import { getSessionRuntimeStatus } from "./codex.mjs";
+import { resolveBackendAdapter, resolveBackendForJob } from "./backend-adapters.mjs";
 import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
@@ -13,15 +13,20 @@ export function sortJobsNewestFirst(jobs) {
 }
 
 function getCurrentSessionId(options = {}) {
-  return options.env?.[SESSION_ID_ENV] ?? process.env[SESSION_ID_ENV] ?? null;
+  return options.sessionId ?? options.env?.[SESSION_ID_ENV] ?? process.env[SESSION_ID_ENV] ?? null;
 }
 
-function filterJobsForCurrentSession(jobs, options = {}) {
+function filterJobsForBridgeContext(jobs, options = {}) {
+  const scopedJobs = jobs.filter(
+    (job) =>
+      (!options.hostId || job.hostId == null || job.hostId === options.hostId) &&
+      (!options.backendId || job.backendId == null || job.backendId === options.backendId)
+  );
   const sessionId = getCurrentSessionId(options);
   if (!sessionId) {
-    return jobs;
+    return scopedJobs;
   }
-  return jobs.filter((job) => job.sessionId === sessionId);
+  return scopedJobs.filter((job) => job.sessionId === sessionId);
 }
 
 function getJobTypeLabel(job) {
@@ -160,8 +165,17 @@ function inferLegacyJobPhase(job, progressPreview = []) {
 
 export function enrichJob(job, options = {}) {
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
+  let backend = null;
+  try {
+    backend = resolveBackendForJob(job, options.env);
+  } catch {
+    backend = null;
+  }
   const enriched = {
     ...job,
+    backendDisplayName: backend?.displayName ?? job.backendId ?? "Agent",
+    backendSessionLabel: backend?.sessionLabel ?? "Agent session ID",
+    resumeCommand: job.threadId && backend?.capabilities.threadResume ? backend.formatResumeCommand(job.threadId) : null,
     kindLabel: getJobTypeLabel(job),
     progressPreview:
       job.status === "queued" || job.status === "running" || job.status === "failed"
@@ -213,7 +227,8 @@ function matchJobReference(jobs, reference, predicate = () => true) {
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  const backend = resolveBackendAdapter(options.backendId ?? null, options.env);
+  const jobs = sortJobsNewestFirst(filterJobsForBridgeContext(listJobs(workspaceRoot), options));
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
@@ -231,7 +246,14 @@ export function buildStatusSnapshot(cwd, options = {}) {
   return {
     workspaceRoot,
     config,
-    sessionRuntime: getSessionRuntimeStatus(options.env, workspaceRoot),
+    backend: {
+      id: backend.id,
+      displayName: backend.displayName,
+      sessionLabel: backend.sessionLabel,
+      sessionColumnLabel: backend.sessionColumnLabel
+    },
+    sessionRuntime:
+      options.sessionRuntime ?? backend.getSessionRuntimeStatus(options.env, workspaceRoot),
     running,
     latestFinished,
     recent,
@@ -253,9 +275,11 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   };
 }
 
-export function resolveResultJob(cwd, reference) {
+export function resolveResultJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
+  const jobs = sortJobsNewestFirst(
+    reference ? listJobs(workspaceRoot) : filterJobsForBridgeContext(listJobs(workspaceRoot), options)
+  );
   const selected = matchJobReference(
     jobs,
     reference,
@@ -291,7 +315,7 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
     return { workspaceRoot, job: selected };
   }
 
-  const sessionScopedActiveJobs = filterJobsForCurrentSession(activeJobs, options);
+  const sessionScopedActiveJobs = filterJobsForBridgeContext(activeJobs, options);
 
   if (sessionScopedActiveJobs.length === 1) {
     return { workspaceRoot, job: sessionScopedActiveJobs[0] };

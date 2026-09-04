@@ -6,7 +6,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { getCodexAvailability } from "./lib/codex.mjs";
+import { resolveBackendAdapter, resolveBackendForJob } from "./lib/backend-adapters.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, listJobs } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
@@ -56,23 +56,23 @@ function buildStopReviewPrompt(input = {}) {
   });
 }
 
-function buildSetupNote(cwd) {
-  const availability = getCodexAvailability(cwd);
+function buildSetupNote(cwd, backend) {
+  const availability = backend.getAvailability(cwd);
   if (availability.available) {
     return null;
   }
 
   const detail = availability.detail ? ` ${availability.detail}.` : "";
-  return `Codex is not set up for the review gate.${detail} Run /codex:setup.`;
+  return `${backend.displayName} is not set up for the review gate.${detail} Run /codex:setup --backend ${backend.id}.`;
 }
 
-function parseStopReviewOutput(rawOutput) {
+function parseStopReviewOutput(rawOutput, backend) {
   const text = String(rawOutput ?? "").trim();
   if (!text) {
     return {
       ok: false,
       reason:
-        "The stop-time Codex review task returned no final output. Run /codex:review --wait manually or bypass the gate."
+        `The stop-time ${backend.displayName} review task returned no final output. Run /codex:review --backend ${backend.id} --wait manually or bypass the gate.`
     };
   }
 
@@ -84,25 +84,25 @@ function parseStopReviewOutput(rawOutput) {
     const reason = firstLine.slice("BLOCK:".length).trim() || text;
     return {
       ok: false,
-      reason: `Codex stop-time review found issues that still need fixes before ending the session: ${reason}`
+      reason: `${backend.displayName} stop-time review found issues that still need fixes before ending the session: ${reason}`
     };
   }
 
   return {
     ok: false,
     reason:
-      "The stop-time Codex review task returned an unexpected answer. Run /codex:review --wait manually or bypass the gate."
+      `The stop-time ${backend.displayName} review task returned an unexpected answer. Run /codex:review --backend ${backend.id} --wait manually or bypass the gate.`
   };
 }
 
-function runStopReview(cwd, input = {}) {
+function runStopReview(cwd, backend, input = {}) {
   const scriptPath = path.join(SCRIPT_DIR, "codex-companion.mjs");
   const prompt = buildStopReviewPrompt(input);
   const childEnv = {
     ...process.env,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
+  const result = spawnSync(process.execPath, [scriptPath, "task", "--backend", backend.id, "--json", prompt], {
     cwd,
     env: childEnv,
     encoding: "utf8",
@@ -113,7 +113,7 @@ function runStopReview(cwd, input = {}) {
     return {
       ok: false,
       reason:
-        "The stop-time Codex review task timed out after 15 minutes. Run /codex:review --wait manually or bypass the gate."
+        `The stop-time ${backend.displayName} review task timed out after 15 minutes. Run /codex:review --backend ${backend.id} --wait manually or bypass the gate.`
     };
   }
 
@@ -122,19 +122,19 @@ function runStopReview(cwd, input = {}) {
     return {
       ok: false,
       reason: detail
-        ? `The stop-time Codex review task failed: ${detail}`
-        : "The stop-time Codex review task failed. Run /codex:review --wait manually or bypass the gate."
+        ? `The stop-time ${backend.displayName} review task failed: ${detail}`
+        : `The stop-time ${backend.displayName} review task failed. Run /codex:review --backend ${backend.id} --wait manually or bypass the gate.`
     };
   }
 
   try {
     const payload = JSON.parse(result.stdout);
-    return parseStopReviewOutput(payload?.rawOutput);
+    return parseStopReviewOutput(payload?.rawOutput, backend);
   } catch {
     return {
       ok: false,
       reason:
-        "The stop-time Codex review task returned invalid JSON. Run /codex:review --wait manually or bypass the gate."
+        `The stop-time ${backend.displayName} review task returned invalid JSON. Run /codex:review --backend ${backend.id} --wait manually or bypass the gate.`
     };
   }
 }
@@ -144,11 +144,13 @@ function main() {
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
+  const backend = resolveBackendAdapter(config.stopReviewBackendId ?? "codex");
 
   const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), input));
   const runningJob = jobs.find((job) => job.status === "queued" || job.status === "running");
+  const runningBackend = runningJob ? resolveBackendForJob(runningJob) : null;
   const runningTaskNote = runningJob
-    ? `Codex task ${runningJob.id} is still running. Check /codex:status and use /codex:cancel ${runningJob.id} if you want to stop it before ending the session.`
+    ? `${runningBackend.displayName} task ${runningJob.id} is still running. Check /codex:status --backend ${runningBackend.id} and use /codex:cancel ${runningJob.id} --backend ${runningBackend.id} if you want to stop it before ending the session.`
     : null;
 
   if (!config.stopReviewGate) {
@@ -156,14 +158,14 @@ function main() {
     return;
   }
 
-  const setupNote = buildSetupNote(cwd);
+  const setupNote = buildSetupNote(cwd, backend);
   if (setupNote) {
     logNote(setupNote);
     logNote(runningTaskNote);
     return;
   }
 
-  const review = runStopReview(cwd, input);
+  const review = runStopReview(cwd, backend, input);
   if (!review.ok) {
     emitDecision({
       decision: "block",

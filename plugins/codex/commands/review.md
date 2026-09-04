@@ -1,11 +1,11 @@
 ---
-description: Run a Codex code review against local git state
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]'
+description: Run a code review against local git state using Codex or OpenCode
+argument-hint: '[--backend codex|opencode] [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
 
-Run a Codex review through the shared built-in reviewer.
+Run a review through the selected backend. Codex uses its built-in reviewer; OpenCode uses the bridge's read-only review task.
 
 Raw slash-command arguments:
 `$ARGUMENTS`

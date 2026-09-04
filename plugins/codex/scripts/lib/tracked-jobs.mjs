@@ -59,7 +59,9 @@ export function createJobLogFile(workspaceRoot, jobId, title) {
 
 export function createJobRecord(base, options = {}) {
   const env = options.env ?? process.env;
-  const sessionId = env[options.sessionIdEnv ?? SESSION_ID_ENV];
+  const sessionId = Object.prototype.hasOwnProperty.call(options, "sessionId")
+    ? options.sessionId
+    : env[options.sessionIdEnv ?? SESSION_ID_ENV];
   return {
     ...base,
     createdAt: nowIso(),
