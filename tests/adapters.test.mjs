@@ -14,7 +14,7 @@ import {
 test("adapter registries expose only implemented hosts and backends", () => {
   assert.deepEqual(
     listHostAdapters().map((host) => host.id),
-    ["claude-code"]
+    ["claude-code", "codex"]
   );
   assert.deepEqual(
     listBackendAdapters().map((backend) => backend.id),
@@ -32,6 +32,10 @@ test("adapter registries expose only implemented hosts and backends", () => {
   assert.equal(openCode.capabilities.sessionImport, false);
   assert.equal(openCode.normalizeModel("anthropic/claude-sonnet-4-5"), "anthropic/claude-sonnet-4-5");
   assert.equal(openCode.normalizeReasoningEffort("high"), "high");
+
+  const codexHost = resolveHostAdapter("codex");
+  assert.equal(codexHost.capabilities.sessionExport, false);
+  assert.equal(codexHost.getSessionId({ CODEX_THREAD_ID: "codex-thread" }), "codex-thread");
 });
 
 test("bridge context resolves explicit and environment-selected adapters", () => {
@@ -52,9 +56,17 @@ test("bridge context resolves explicit and environment-selected adapters", () =>
     }
   );
   assert.equal(fromEnvironment.sessionId, "session-legacy");
+
+  const codexHost = resolveBridgeContext(
+    { host: "codex", backend: "opencode" },
+    { CODEX_SESSION_ID: "codex-session" }
+  );
+  assert.equal(codexHost.hostId, "codex");
+  assert.equal(codexHost.backendId, "opencode");
+  assert.equal(codexHost.sessionId, "codex-session");
 });
 
 test("adapter registries reject unimplemented integrations instead of silently falling back", () => {
-  assert.throws(() => resolveHostAdapter("qoder"), /Unsupported host adapter "qoder".*claude-code/);
+  assert.throws(() => resolveHostAdapter("qoder"), /Unsupported host adapter "qoder".*claude-code, codex/);
   assert.throws(() => resolveBackendAdapter("qoder"), /Unsupported agent backend "qoder".*codex, opencode/);
 });

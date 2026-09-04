@@ -27,7 +27,25 @@ const CLAUDE_CODE_HOST = Object.freeze({
   }
 });
 
-const HOSTS = new Map([[CLAUDE_CODE_HOST.id, CLAUDE_CODE_HOST]]);
+const CODEX_HOST = Object.freeze({
+  id: "codex",
+  displayName: "Codex",
+  stopReviewTaskMarker: null,
+  capabilities: Object.freeze({
+    lifecycleHooks: false,
+    sessionExport: false,
+    sessionIdentity: true
+  }),
+  getSessionId(env = process.env) {
+    return env[BRIDGE_SESSION_ID_ENV] ?? env.CODEX_THREAD_ID ?? env.CODEX_SESSION_ID ?? null;
+  },
+  resolveSessionExport: null
+});
+
+const HOSTS = new Map([
+  [CLAUDE_CODE_HOST.id, CLAUDE_CODE_HOST],
+  [CODEX_HOST.id, CODEX_HOST]
+]);
 
 function supportedHostIds() {
   return [...HOSTS.keys()].join(", ");

@@ -10,7 +10,7 @@ agents without duplicating job control, state, review targeting, or rendering.
 Host adapter                 Bridge core                    Backend adapter
 --------------------         --------------------------     ----------------------
 Claude Code hooks      --->  jobs / state / git targets --> Codex app-server
-future Codex host            cancellation / progress        OpenCode JSON CLI
+Codex plugin skill           cancellation / progress        OpenCode JSON CLI
 future other hosts           capability negotiation         future Qoder
                              result normalization
 ```
@@ -25,7 +25,7 @@ them with lossy prompt concatenation.
 
 ## Implemented contracts
 
-- `lib/host-adapters.mjs` registers host identity and session-export behavior.
+- `lib/host-adapters.mjs` registers Claude Code and Codex host identity plus optional session-export behavior.
 - `lib/backend-adapters.mjs` registers execution, review, resume, import, interrupt, and setup behavior.
 - `lib/bridge-context.mjs` resolves a host/backend pair from CLI flags or environment variables and
   performs capability checks.
@@ -73,9 +73,9 @@ Every host must provide:
 Host-specific commands and packaging stay outside the bridge core. This repository can continue to
 ship the `codex` Claude Code plugin while another package supplies the same bridge to a Codex host.
 
-For Codex as a host, ship a separate Codex plugin that wraps the bridge with a skill and, when richer
-typed control is needed, a local MCP server. Do not try to make one manifest serve both Claude Code
-and Codex: the shared unit should be the bridge runtime, while each host owns its native packaging.
+For Codex as a host, a separate Codex plugin wraps the bridge with a skill. When richer typed control
+is needed, it can add a local MCP server. Do not try to make one manifest serve both Claude Code and
+Codex: the shared unit is the bridge runtime, while each host owns its native packaging.
 Codex plugins can bundle reusable skills and connectors/MCP tools across supported Codex surfaces.
 
 Reference: [Codex and ChatGPT plugins](https://learn.chatgpt.com/docs/plugins).
