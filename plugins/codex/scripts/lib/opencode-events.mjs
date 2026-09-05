@@ -103,6 +103,23 @@ export function createOpenCodeEventCollector(options = {}) {
 
   function consume(event) {
     const properties = event?.properties ?? {};
+    if (typeof event?.sessionID === "string") {
+      state.sessionId = event.sessionID;
+    }
+    if (event?.type === "error") {
+      state.error = errorMessage(event.error) || "OpenCode session failed.";
+      emitProgress(options.onProgress, state.error, "failed", { threadId: state.sessionId });
+      return;
+    }
+    if (event?.part && typeof event.part === "object") {
+      collectPartEvent(state, { part: event.part }, options.onProgress);
+      if (event.type === "step_finish") {
+        emitProgress(options.onProgress, "OpenCode session completed.", "completed", {
+          threadId: state.sessionId
+        });
+      }
+      return;
+    }
     if (event?.type === "session.created") {
       state.sessionId = properties.info?.id ?? state.sessionId;
       emitProgress(options.onProgress, `OpenCode session ready (${state.sessionId}).`, "starting", {

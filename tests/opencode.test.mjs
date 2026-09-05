@@ -67,6 +67,51 @@ test("OpenCode JSON events are normalized into the common task result", () => {
   assert.ok(progress.some((event) => event.phase === "editing"));
 });
 
+test("OpenCode CLI JSON events are normalized into the common task result", () => {
+  const collector = createOpenCodeEventCollector();
+  collector.consume({
+    type: "step_start",
+    sessionID: "ses_cli",
+    part: { id: "step_1", messageID: "msg_cli", sessionID: "ses_cli", type: "step-start" }
+  });
+  collector.consume({
+    type: "reasoning",
+    sessionID: "ses_cli",
+    part: { id: "reason_1", messageID: "msg_cli", sessionID: "ses_cli", type: "reasoning", text: "Inspecting files" }
+  });
+  collector.consume({
+    type: "text",
+    sessionID: "ses_cli",
+    part: { id: "text_1", messageID: "msg_cli", sessionID: "ses_cli", type: "text", text: "Done." }
+  });
+  collector.consume({
+    type: "step_finish",
+    sessionID: "ses_cli",
+    part: { id: "step_2", messageID: "msg_cli", sessionID: "ses_cli", type: "step-finish" }
+  });
+
+  assert.deepEqual(collector.result(), {
+    threadId: "ses_cli",
+    finalMessage: "Done.",
+    reasoningSummary: ["Inspecting files"],
+    touchedFiles: [],
+    errorMessage: null,
+    invalidLines: []
+  });
+});
+
+test("OpenCode CLI top-level errors preserve their actionable message", () => {
+  const collector = createOpenCodeEventCollector();
+  collector.consume({
+    type: "error",
+    sessionID: "ses_failed",
+    error: { name: "UnknownError", data: { message: "Unexpected server error. Check server logs for details." } }
+  });
+
+  assert.equal(collector.result().threadId, "ses_failed");
+  assert.equal(collector.result().errorMessage, "Unexpected server error. Check server logs for details.");
+});
+
 test("OpenCode task names use the backend-neutral bridge prefix", () => {
   assert.equal(buildOpenCodeTaskThreadName("inspect the parser"), "Agent Bridge Task: inspect the parser");
 });
