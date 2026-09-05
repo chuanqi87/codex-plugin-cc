@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 
 import { buildOpenCodeEnv, installFakeOpenCode } from "./fake-opencode-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { findLatestOpenCodeTaskSession, runOpenCodeTask } from "../plugins/codex/scripts/lib/opencode.mjs";
+import { upsertJob } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "codex", "scripts", "codex-companion.mjs");
@@ -74,6 +76,8 @@ test("OpenCode task maps model, effort, and read-only policy to the CLI", () => 
   assert.equal(invocation.agent, "agent-bridge-readonly");
   assert.equal(invocation.config.agent[invocation.agent].permission.edit, "deny");
   assert.equal(invocation.args.includes("--auto"), false);
+  assert.equal(invocation.args.includes("--thinking"), true);
+  assert.equal(invocation.args.includes("inspect this repo"), false);
 });
 
 test("OpenCode write tasks use the workspace-write policy and report touched files", () => {
@@ -123,6 +127,132 @@ test("OpenCode review uses the read-only backend path", () => {
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /No material issues found/);
   assert.equal(readFakeState(statePath).runs[0].agent, "agent-bridge-readonly");
+  assert.match(readFakeState(statePath).runs[0].prompt, /-hello\n\+changed/);
+});
+
+test("OpenCode passes long and flag-like prompts intact over stdin", async () => {
+  const repo = createRepo();
+  const binDir = makeTempDir();
+  const statePath = installFakeOpenCode(binDir);
+  const prompt = '--model do-not-parse "quoted"\n' + "内容".repeat(100000);
+  const result = await runOpenCodeTask(repo, { prompt, env: buildOpenCodeEnv(binDir) });
+  assert.equal(result.status, 0, result.stderr);
+  const invocation = readFakeState(statePath).runs[0];
+  assert.equal(invocation.prompt, prompt);
+  assert.equal(invocation.model, null);
+  assert.ok(invocation.args.every((arg) => arg.length < 1024));
+});
+
+for (const [scenario, expected] of [
+  ["empty", /without a final assistant response/],
+  ["malformed", /without a final assistant response/],
+  ["partial", /before completing the response/],
+  ["truncated", /reason "length"/],
+  ["zero-exit-error", /Provider rejected the request/]
+]) {
+  test(`OpenCode reports ${scenario} streams as failures even with exit code zero`, () => {
+    const repo = createRepo();
+    const binDir = makeTempDir();
+    installFakeOpenCode(binDir);
+    const result = run("node", [SCRIPT, "task", "--backend", "opencode", "--json", "inspect this repo"], {
+      cwd: repo, env: buildOpenCodeEnv(binDir, { FAKE_OPENCODE_SCENARIO: scenario })
+    });
+    assert.notEqual(result.status, 0);
+    const payload = JSON.parse(result.stdout);
+    assert.match(payload.error, expected);
+    assert.match(payload.stderr, expected);
+  });
+}
+
+test("OpenCode logs reasoning and final output while discarding intermediate answers", () => {
+  const repo = createRepo();
+  const binDir = makeTempDir();
+  installFakeOpenCode(binDir);
+  const env = buildOpenCodeEnv(binDir, { FAKE_OPENCODE_SCENARIO: "multi-step" });
+  const result = run("node", [SCRIPT, "task", "--backend", "opencode", "--json", "inspect this repo"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).rawOutput, "Handled the OpenCode task.");
+  const status = run("node", [SCRIPT, "status", "--backend", "opencode", "--json"], { cwd: repo, env });
+  const job = JSON.parse(status.stdout).latestFinished;
+  const log = fs.readFileSync(job.logFile, "utf8");
+  assert.match(log, /Inspected the requested scope/);
+  assert.match(log, /Handled the OpenCode task/);
+});
+
+test("OpenCode adversarial review receives multi-file diffs and its output schema", () => {
+  const repo = createRepo();
+  const binDir = makeTempDir();
+  const statePath = installFakeOpenCode(binDir);
+  for (const name of ["a.js", "b.js", "c.js"]) fs.writeFileSync(path.join(repo, name), "original\n");
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+  for (const name of ["a.js", "b.js", "c.js"]) fs.writeFileSync(path.join(repo, name), `changed-${name}\n`);
+  const result = run("node", [SCRIPT, "adversarial-review", "--backend", "opencode", "--json"], {
+    cwd: repo, env: buildOpenCodeEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const prompt = readFakeState(statePath).runs[0].prompt;
+  for (const name of ["a.js", "b.js", "c.js"]) assert.ok(prompt.includes(`+changed-${name}`));
+  assert.match(prompt, /"required":\["verdict","summary","findings","next_steps"\]/);
+  assert.equal(JSON.parse(result.stdout).result.verdict, "approve");
+});
+
+test("OpenCode structured review rejects a plain-text response", () => {
+  const repo = createRepo();
+  const binDir = makeTempDir();
+  installFakeOpenCode(binDir);
+  const result = run("node", [SCRIPT, "adversarial-review", "--backend", "opencode", "--json"], {
+    cwd: repo, env: buildOpenCodeEnv(binDir, { FAKE_OPENCODE_SCENARIO: "invalid-structured" })
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(JSON.parse(result.stdout).agent.stderr, /did not return valid JSON/);
+});
+
+test("OpenCode never resumes or shows legacy Codex jobs without backend metadata", () => {
+  const repo = createRepo();
+  const binDir = makeTempDir();
+  const statePath = installFakeOpenCode(binDir);
+  const sessionId = "scope-regression";
+  // Use the same explicit data directory in the parent and child processes.
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  const pluginData = makeTempDir("legacy-job-data-");
+  try {
+    process.env.CLAUDE_PLUGIN_DATA = pluginData;
+    upsertJob(repo, { id: "legacy-task", jobClass: "task", sessionId, threadId: "codex-thread", status: "completed" });
+  } finally {
+    if (previous == null) delete process.env.CLAUDE_PLUGIN_DATA;
+    else process.env.CLAUDE_PLUGIN_DATA = previous;
+  }
+  const env = buildOpenCodeEnv(binDir, { CLAUDE_PLUGIN_DATA: pluginData, AGENT_BRIDGE_SESSION_ID: sessionId });
+  const resumed = run("node", [SCRIPT, "task", "--backend", "opencode", "--resume-last", "continue"], { cwd: repo, env });
+  assert.notEqual(resumed.status, 0);
+  assert.match(resumed.stderr, /No previous OpenCode task thread/);
+  assert.equal(fs.existsSync(statePath), false);
+  const status = run("node", [SCRIPT, "status", "--backend", "opencode", "--json"], { cwd: repo, env });
+  assert.doesNotMatch(status.stdout, /codex-thread/);
+});
+
+test("OpenCode fallback resume selects the newest root task in the exact workspace", async () => {
+  const repo = createRepo();
+  const binDir = makeTempDir();
+  const statePath = installFakeOpenCode(binDir);
+  const base = { title: "Agent Bridge Task: inspect", directory: repo };
+  fs.writeFileSync(statePath, JSON.stringify({ sessions: [
+    { ...base, id: "old", time: { updated: 1 } },
+    { ...base, id: "no-directory", directory: undefined, time: { updated: 100 } },
+    { ...base, id: "other-workspace", directory: binDir, time: { updated: 100 } },
+    { ...base, id: "subagent", parentID: "new", time: { updated: 100 } },
+    { ...base, id: "archived", time: { updated: 100, archived: 100 } },
+    { ...base, id: "wrong-prefix", title: "Agent Bridge Task impostor", time: { updated: 100 } },
+    { ...base, id: "new", time: { updated: 2 } }
+  ] }));
+  const previousPath = process.env.PATH;
+  try {
+    process.env.PATH = buildOpenCodeEnv(binDir).PATH;
+    assert.equal((await findLatestOpenCodeTaskSession(repo)).id, "new");
+  } finally {
+    process.env.PATH = previousPath;
+  }
 });
 
 test("OpenCode rejects unsupported cross-agent session transfer", () => {
@@ -196,6 +326,7 @@ test("review gate persists and invokes the selected OpenCode backend", () => {
   assert.equal(setup.status, 0, setup.stderr);
   const setupPayload = JSON.parse(setup.stdout);
   assert.equal(setupPayload.reviewGateBackendId, "opencode");
+  fs.writeFileSync(path.join(repo, "README.md"), "stop-gate evidence\n");
 
   const stopped = run("node", [STOP_HOOK], {
     cwd: repo,
@@ -209,4 +340,5 @@ test("review gate persists and invokes the selected OpenCode backend", () => {
   assert.equal(stopped.status, 0, stopped.stderr);
   assert.equal(stopped.stdout.trim(), "");
   assert.match(readFakeState(statePath).runs.at(-1).prompt, /Run a stop-gate review/);
+  assert.match(readFakeState(statePath).runs.at(-1).prompt, /-hello\n\+stop-gate evidence/);
 });

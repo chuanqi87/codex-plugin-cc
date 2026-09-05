@@ -87,9 +87,23 @@ message, reasoning, tool, error, and file events into the bridge result. It supp
 review-via-task, model and variant selection, persistent session resume, foreground execution, and the
 shared background job lifecycle.
 
+`opencode-process.mjs` owns process streaming and stdin delivery. `opencode-events.mjs` selects the
+last assistant message, distinguishes tool steps from terminal completion, records successful file
+tool metadata, and bounds malformed-line diagnostics. Reasoning requires the CLI's `--thinking`
+flag. A successful process exit without a completed final message is a failed bridge run.
+
+`opencode-review.mjs` collects inline Git evidence with a 512 KiB limit for the shell-denied review
+agent. Both review paths and the stop gate use this collector; they reject an oversized context
+instead of asking the agent to run Git or silently dropping the diff. The adapter's optional
+`collectReviewContext` method lets other backends keep their own context strategy. Structured output
+schemas are supplied in the prompt and validated locally against the bundled schema assertions;
+this CLI path does not claim native constrained generation.
+
 The bridge injects a uniquely named OpenCode agent through `OPENCODE_CONFIG_CONTENT` for each run.
-Read-only runs deny edits, delegated tasks, external-directory access, and shell commands; OpenCode's
-built-in read/search tools remain available. Write runs allow edits within the workspace permission
+Read-only runs deny edits, delegated tasks, external-directory access, shell commands, and unlisted
+custom/MCP tools; OpenCode's built-in read/search tools remain available. Write runs allow edits and
+shell commands for implementation and verification, while denying delegated tasks and interactive
+questions. Both modes use the workspace permission
 policy and never pass the dangerous `--auto` permission flag. This is OpenCode's permission layer, not
 an operating-system sandbox. Existing inline OpenCode configuration is preserved when valid.
 
@@ -98,6 +112,15 @@ Claude Code transcript contract. Protocol-level turn interruption is also disabl
 adapter; background cancellation terminates the worker process tree. A later long-lived server adapter
 can add cooperative cancellation. The V2 embedded SDK is attractive for that follow-up, but its
 official docs still mark it beta.
+
+Resume candidates are filtered by explicit workspace directory, root-session identity, archive
+state, and bridge task title, then sorted by update time. Missing host/backend job fields resolve to
+Claude Code/Codex when filtering as well as when executing a stored job.
+
+Validation covers real CLI-shaped fixtures for success, multi-step responses, errors with exit zero,
+incomplete output, long stdin prompts, schema failures, cancellation, review evidence, and resume
+isolation. Local smoke checks with OpenCode 1.18.27 use an isolated OpenAI-compatible HTTP test
+provider to exercise the actual CLI and session database without provider credentials.
 
 References: [OpenCode CLI](https://dev.opencode.ai/docs/cli/),
 [OpenCode V2 SDK](https://opencode.ai/v2/docs/build/sdk).

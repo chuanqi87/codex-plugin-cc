@@ -1,6 +1,7 @@
 import process from "node:process";
 
 import { BRIDGE_BACKEND_ENV } from "./bridge-env.mjs";
+import { collectOpenCodeReviewContext } from "./opencode-review.mjs";
 
 import {
   buildPersistentTaskThreadName,
@@ -130,6 +131,7 @@ const OPENCODE_BACKEND = Object.freeze({
   }),
   defaultContinuePrompt: DEFAULT_CONTINUE_PROMPT,
   buildTaskThreadName: buildOpenCodeTaskThreadName,
+  collectReviewContext: collectOpenCodeReviewContext,
   findLatestTaskThread: findLatestOpenCodeTaskSession,
   formatResumeCommand(threadId) {
     return `opencode --session ${threadId}`;

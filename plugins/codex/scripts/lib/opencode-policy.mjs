@@ -21,6 +21,17 @@ function parseInlineConfig(rawConfig) {
 function buildPermissionPolicy(readOnly) {
   if (readOnly) {
     return {
+      "*": "deny",
+      read: { "*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow" },
+      glob: "allow",
+      grep: "allow",
+      list: "allow",
+      webfetch: "allow",
+      websearch: "allow",
+      lsp: "allow",
+      skill: "allow",
+      todoread: "allow",
+      todowrite: "allow",
       edit: "deny",
       task: "deny",
       external_directory: "deny",
@@ -29,7 +40,12 @@ function buildPermissionPolicy(readOnly) {
   }
   return {
     edit: "allow",
-    external_directory: "deny"
+    bash: "allow",
+    task: "deny",
+    external_directory: "deny",
+    question: "deny",
+    plan_enter: "deny",
+    plan_exit: "deny"
   };
 }
 

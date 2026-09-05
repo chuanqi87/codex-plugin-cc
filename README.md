@@ -35,7 +35,7 @@ they already have.
 Add the marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add openai/codex-plugin-cc
+/plugin marketplace add chuanqi87/codex-plugin-cc
 ```
 
 Install the plugin:
@@ -173,13 +173,14 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
 
-#### Experimental OpenCode backend
+#### OpenCode backend
 
 If OpenCode is installed, task and review commands can select it explicitly:
 
 ```bash
 /codex:setup --backend opencode
 /codex:review --backend opencode
+/codex:adversarial-review --backend opencode --base main focus on error recovery
 /codex:rescue --backend opencode investigate why the tests started failing
 /codex:rescue --backend opencode --resume continue with the safest fix
 ```
@@ -187,6 +188,37 @@ If OpenCode is installed, task and review commands can select it explicitly:
 OpenCode supports task execution, review, background jobs, result retrieval, cancellation, and session
 resume through this bridge. Claude transcript transfer is not supported for OpenCode. Model values are
 passed through in OpenCode's `provider/model` form, and `--effort` maps to its model variant.
+
+The integration is verified against OpenCode CLI **1.18.27**. Run `opencode models` to discover
+provider/model names, then use `--model <provider/model>` and optionally `--effort <variant>`.
+For direct bridge use, including a Codex host:
+
+```bash
+node plugins/codex/scripts/codex-companion.mjs task --host codex --backend opencode --write --prompt-file task.md
+node plugins/codex/scripts/codex-companion.mjs task --host codex --backend opencode --resume-last "continue the fix"
+node plugins/codex/scripts/codex-companion.mjs status --host codex --backend opencode --json
+```
+
+- Prompts travel over stdin, so large prompt files and text starting with CLI flags remain intact.
+- Read-only runs allow built-in analysis tools and deny edits, shell commands, subagents, and unlisted
+  tools such as custom MCP tools. Write runs enable editing and shell commands for implementation and
+  tests. These are OpenCode permissions, not an operating-system sandbox.
+- Normal, adversarial, and stop-gate reviews receive Git evidence directly from the bridge. Branch
+  reviews use the merge base; working-tree reviews include staged, unstaged, and untracked changes.
+  Review context is limited to 512 KiB and fails explicitly when exceeded. Narrow the branch diff or
+  delegate a focused analysis task in that case. Skipped binary/large untracked files are labeled in
+  the context and can limit review coverage.
+- The bridge selects the final assistant response across tool steps, retains reasoning in job logs,
+  and records edits from successful file tools. Empty, truncated, interrupted, or invalid structured
+  responses produce a failed job with diagnostic details; they are never reported as clean reviews.
+- Resume is scoped by host, backend, workspace, and host session when available. Legacy jobs belong
+  to the original Claude Code + Codex pairing. Raw OpenCode session discovery requires an explicit
+  matching directory and excludes child and archived sessions.
+
+To default direct bridge commands to OpenCode, set `AGENT_BRIDGE_BACKEND=opencode` in the launching
+environment. Use the same host/backend selection when reading status or results. Individual job IDs
+can still be inspected explicitly across backends. For stop-time reviews, select it with
+`/codex:setup --backend opencode --enable-review-gate`.
 
 ### `/codex:transfer`
 

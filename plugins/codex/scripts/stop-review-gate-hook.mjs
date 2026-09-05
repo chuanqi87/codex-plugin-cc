@@ -97,15 +97,24 @@ function parseStopReviewOutput(rawOutput, backend) {
 
 function runStopReview(cwd, backend, input = {}) {
   const scriptPath = path.join(SCRIPT_DIR, "codex-companion.mjs");
-  const prompt = buildStopReviewPrompt(input);
+  let prompt = buildStopReviewPrompt(input);
+  if (backend.collectReviewContext) {
+    try {
+      const context = backend.collectReviewContext(cwd, { mode: "working-tree", label: "working tree diff" });
+      prompt += `\n\n${context.collectionGuidance}\nCurrent working-tree evidence may include earlier turns; only assess changes attributable to the previous turn.\n<repository_context>\n${context.content}\n</repository_context>`;
+    } catch (error) {
+      return { ok: false, reason: `Unable to collect ${backend.displayName} stop-review evidence: ${error.message}` };
+    }
+  }
   const childEnv = {
     ...process.env,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--backend", backend.id, "--json", prompt], {
+  const result = spawnSync(process.execPath, [scriptPath, "task", "--backend", backend.id, "--json"], {
     cwd,
     env: childEnv,
     encoding: "utf8",
+    input: prompt,
     timeout: STOP_REVIEW_TIMEOUT_MS
   });
 

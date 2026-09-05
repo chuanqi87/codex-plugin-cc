@@ -35,7 +35,27 @@ function appendReasoningPart(state, part, delta) {
 
 function collectPartEvent(state, properties, onProgress) {
   const part = properties.part ?? {};
+  if (state.messageRoles.get(part.messageID) === "user") return;
   state.sessionId = part.sessionID ?? state.sessionId;
+  if (part.messageID && !state.assistantMessageIds.includes(part.messageID)) {
+    state.assistantMessageIds.push(part.messageID);
+    state.completed = false;
+  }
+  if (part.type === "step-start") {
+    state.completed = false;
+    emitProgress(onProgress, "OpenCode started a response step.", "running", { threadId: state.sessionId });
+    return;
+  }
+  if (part.type === "step-finish") {
+    state.completed = part.reason === "stop";
+    if (["length", "content-filter", "error"].includes(part.reason)) {
+      state.error = `OpenCode response ended with reason "${part.reason}"; the result may be incomplete.`;
+    }
+    emitProgress(onProgress, `OpenCode response step finished (${part.reason ?? "unknown"}).`, "running", {
+      threadId: state.sessionId
+    });
+    return;
+  }
   if (part.type === "text") {
     appendTextPart(state, part, properties.delta);
     emitProgress(onProgress, "OpenCode is composing the final response.", "responding", {
@@ -45,13 +65,19 @@ function collectPartEvent(state, properties, onProgress) {
   }
   if (part.type === "reasoning") {
     appendReasoningPart(state, part, properties.delta);
-    emitProgress(onProgress, "OpenCode is reasoning.", "reasoning", { threadId: state.sessionId });
+    emitProgress(onProgress, "OpenCode is reasoning.", "reasoning", {
+      threadId: state.sessionId,
+      logTitle: "Reasoning summary",
+      logBody: part.time?.end ? part.text : null
+    });
     return;
   }
   if (part.type === "tool") {
     const toolName = part.tool ?? "tool";
     const toolStatus = part.state?.status ?? "running";
-    emitProgress(onProgress, `${toolStatus === "completed" ? "Completed" : "Running"} ${toolName}.`, "tool", {
+    if (toolStatus === "completed") collectToolFiles(state, part);
+    const action = toolStatus === "error" ? "Failed" : toolStatus === "completed" ? "Completed" : "Running";
+    emitProgress(onProgress, `${action} ${toolName}.${toolStatus === "error" ? ` ${part.state.error ?? ""}` : ""}`, "investigating", {
       threadId: state.sessionId
     });
     return;
@@ -64,16 +90,30 @@ function collectPartEvent(state, properties, onProgress) {
   }
 }
 
-function createCollectorState() {
+function collectToolFiles(state, part) {
+  if (!["edit", "write", "apply_patch", "multiedit"].includes(part.tool)) return;
+  const metadata = part.state.metadata ?? {};
+  const files = [part.state.input?.filePath, metadata.filepath];
+  for (const file of Array.isArray(metadata.files) ? metadata.files : []) {
+    files.push(file.filePath ?? file.relativePath, file.movePath);
+  }
+  for (const file of files) {
+    if (typeof file === "string" && file) state.touchedFiles.add(file);
+  }
+}
+
+function createCollectorState(threadId) {
   return {
-    sessionId: null,
+    sessionId: threadId ?? null,
     assistantMessageIds: [],
+    messageRoles: new Map(),
     textParts: new Map(),
     textOrder: [],
     reasoningParts: new Map(),
     reasoningOrder: [],
     touchedFiles: new Set(),
     error: null,
+    completed: false,
     invalidLines: []
   };
 }
@@ -83,29 +123,31 @@ function buildCollectorResult(state) {
   const selectedParts = state.textOrder
     .map((id) => state.textParts.get(id))
     .filter((part) => part && (!latestMessageId || part.messageId === latestMessageId));
-  const fallbackParts = state.textOrder.map((id) => state.textParts.get(id)).filter(Boolean);
-  const finalParts = selectedParts.length > 0 ? selectedParts : fallbackParts;
   const reasoningSummary = state.reasoningOrder
     .map((id) => state.reasoningParts.get(id)?.replace(/\s+/g, " ").trim())
     .filter(Boolean);
   return {
     threadId: state.sessionId,
-    finalMessage: finalParts.map((part) => part.text).join("").trim(),
+    finalMessage: selectedParts.map((part) => part.text).join("\n\n").trim(),
     reasoningSummary: [...new Set(reasoningSummary)],
     touchedFiles: [...state.touchedFiles],
     errorMessage: state.error,
+    completed: state.completed,
     invalidLines: state.invalidLines
   };
 }
 
 export function createOpenCodeEventCollector(options = {}) {
-  const state = createCollectorState();
+  const state = createCollectorState(options.threadId);
 
   function consume(event) {
     const properties = event?.properties ?? {};
-    if (typeof event?.sessionID === "string") {
-      state.sessionId = event.sessionID;
-    }
+    if (event?.type === "session.created" && properties.info?.parentID) return;
+    const sessionId = event?.part?.sessionID ?? properties.part?.sessionID ??
+      properties.info?.sessionID ?? properties.sessionID ?? event?.sessionID ??
+      (event?.type === "session.created" ? properties.info?.id : null);
+    if (sessionId && state.sessionId && sessionId !== state.sessionId) return;
+    state.sessionId ??= sessionId ?? null;
     if (event?.type === "error") {
       state.error = errorMessage(event.error) || "OpenCode session failed.";
       emitProgress(options.onProgress, state.error, "failed", { threadId: state.sessionId });
@@ -113,11 +155,6 @@ export function createOpenCodeEventCollector(options = {}) {
     }
     if (event?.part && typeof event.part === "object") {
       collectPartEvent(state, { part: event.part }, options.onProgress);
-      if (event.type === "step_finish") {
-        emitProgress(options.onProgress, "OpenCode session completed.", "completed", {
-          threadId: state.sessionId
-        });
-      }
       return;
     }
     if (event?.type === "session.created") {
@@ -129,11 +166,14 @@ export function createOpenCodeEventCollector(options = {}) {
     }
     if (event?.type === "message.updated") {
       const info = properties.info ?? {};
+      if (info.id && info.role) state.messageRoles.set(info.id, info.role);
       state.sessionId = info.sessionID ?? state.sessionId;
       const messageId = info.role === "assistant" ? info.id ?? null : null;
       if (messageId && !state.assistantMessageIds.includes(messageId)) {
         state.assistantMessageIds.push(messageId);
+        state.completed = false;
       }
+      if (messageId && info.finish === "stop") state.completed = true;
       if (info.error) {
         state.error = errorMessage(info.error);
       }
@@ -165,10 +205,8 @@ export function createOpenCodeEventCollector(options = {}) {
       emitProgress(options.onProgress, state.error, "failed", { threadId: state.sessionId });
       return;
     }
-    if (event?.type === "session.idle") {
-      emitProgress(options.onProgress, "OpenCode session completed.", "completed", {
-        threadId: state.sessionId
-      });
+    if (event?.type === "session.idle" || (event?.type === "session.status" && properties.status?.type === "idle")) {
+      state.completed = true;
     }
   }
 
@@ -177,11 +215,15 @@ export function createOpenCodeEventCollector(options = {}) {
     if (!trimmed) {
       return;
     }
+    let event;
     try {
-      consume(JSON.parse(trimmed));
+      event = JSON.parse(trimmed);
     } catch {
-      state.invalidLines.push(trimmed);
+      state.invalidLines.push(trimmed.slice(0, 2048));
+      if (state.invalidLines.length > 8) state.invalidLines.shift();
+      return;
     }
+    consume(event);
   }
 
   return {

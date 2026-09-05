@@ -56,7 +56,8 @@ const resumedSessionId = option("--session");
 const sessionId = resumedSessionId || "ses_" + state.nextSessionId++;
 const directory = option("--dir") || process.cwd();
 const title = option("--title") || "Untitled";
-const prompt = args[args.length - 1];
+const prompt = fs.readFileSync(0, "utf8");
+const scenario = process.env.FAKE_OPENCODE_SCENARIO;
 const run = {
   args,
   agent: option("--agent"),
@@ -74,25 +75,45 @@ if (!resumedSessionId) {
 }
 saveState(state);
 
-send({ type: "session.created", properties: { info: { id: sessionId } } });
-send({ type: "message.updated", properties: { info: { id: "msg_" + state.runs.length, role: "assistant", sessionID: sessionId } } });
+if (scenario === "empty") process.exit(0);
+if (scenario === "malformed") {
+  process.stdout.write("OpenCode protocol was not available\\n");
+  process.exit(0);
+}
+const messageId = "msg_" + state.runs.length;
+function part(type, value, messageID = messageId) {
+  send({ type: type.replaceAll("-", "_"), sessionID: sessionId, part: { id: type + "_" + messageID, messageID, sessionID: sessionId, type, ...value } });
+}
+part("step-start", {});
+if (scenario === "zero-exit-error") {
+  send({ type: "error", sessionID: sessionId, error: { data: { message: "Provider rejected the request." } } });
+  process.exit(0);
+}
 if (prompt.includes("fail the run")) {
-  send({ type: "session.error", properties: { error: { data: { message: "Synthetic OpenCode failure." } } } });
+  send({ type: "error", sessionID: sessionId, error: { data: { message: "Synthetic OpenCode failure." } } });
   process.exit(1);
 }
-send({ type: "message.part.updated", properties: { part: { id: "reason_" + state.runs.length, messageID: "msg_" + state.runs.length, sessionID: sessionId, type: "reasoning", text: "Inspected the requested scope." } } });
+if (args.includes("--thinking")) part("reasoning", { text: "Inspected the requested scope.", time: { end: Date.now() } });
 
 function finish() {
   if (option("--agent") === "agent-bridge-workspace-write") {
-    send({ type: "file.edited", properties: { file: "src/app.js" } });
+    part("tool", { tool: "write", state: { status: "completed", input: { filePath: "src/app.js" }, metadata: {} } });
   }
-  const response = prompt.includes("Run a stop-gate review")
+  if (scenario === "multi-step") {
+    part("text", { text: "I will inspect the code first." }, "msg_intermediate");
+    part("step-finish", { reason: "tool-calls" }, "msg_intermediate");
+    part("step-start", {});
+  }
+  const response = prompt.includes("Return only valid JSON matching this JSON Schema:") && scenario !== "invalid-structured"
+    ? JSON.stringify({ verdict: "approve", summary: "No material issues found.", findings: [], next_steps: [] })
+    : prompt.includes("Run a stop-gate review")
     ? "ALLOW: no blocking issue found."
     : (prompt.includes("Review the current")
         ? "Reviewed the requested changes. No material issues found."
         : (resumedSessionId ? "Continued the OpenCode task." : "Handled the OpenCode task."));
-  send({ type: "message.part.updated", properties: { part: { id: "text_" + state.runs.length, messageID: "msg_" + state.runs.length, sessionID: sessionId, type: "text", text: response } } });
-  send({ type: "session.idle", properties: { sessionID: sessionId } });
+  const finalMessageId = scenario === "multi-step" ? "msg_final" : messageId;
+  part("text", { text: response, time: { end: Date.now() } }, finalMessageId);
+  if (scenario !== "partial") part("step-finish", { reason: scenario === "truncated" ? "length" : "stop" }, finalMessageId);
 }
 
 if (prompt.includes("wait until cancelled")) {

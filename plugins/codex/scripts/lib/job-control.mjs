@@ -19,8 +19,8 @@ function getCurrentSessionId(options = {}) {
 function filterJobsForBridgeContext(jobs, options = {}) {
   const scopedJobs = jobs.filter(
     (job) =>
-      (!options.hostId || job.hostId == null || job.hostId === options.hostId) &&
-      (!options.backendId || job.backendId == null || job.backendId === options.backendId)
+      (!options.hostId || (job.hostId ?? "claude-code") === options.hostId) &&
+      (!options.backendId || (job.backendId ?? "codex") === options.backendId)
   );
   const sessionId = getCurrentSessionId(options);
   if (!sessionId) {

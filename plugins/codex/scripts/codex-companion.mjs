@@ -300,8 +300,8 @@ function filterJobsForBridgeContext(jobs, context) {
   const sessionId = getCurrentHostSessionId(context);
   const scopedJobs = jobs.filter(
     (job) =>
-      (job.hostId == null || job.hostId === context.host.id) &&
-      (job.backendId == null || job.backendId === context.backend.id)
+      (job.hostId ?? "claude-code") === context.host.id &&
+      (job.backendId ?? "codex") === context.backend.id
   );
   if (!sessionId) {
     return scopedJobs;
@@ -423,7 +423,7 @@ async function executeReviewRun(request) {
     };
   }
 
-  const reviewContext = collectReviewContext(request.cwd, target);
+  const reviewContext = (bridge.backend.collectReviewContext ?? collectReviewContext)(request.cwd, target);
   const prompt = buildAdversarialReviewPrompt(reviewContext, focusText);
   const result = await bridge.backend.runTask(reviewContext.repoRoot, {
     prompt,
@@ -436,6 +436,10 @@ async function executeReviewRun(request) {
     status: result.status,
     failureMessage: result.error?.message ?? result.stderr
   });
+  if (result.status !== 0) {
+    parsed.parsed = null;
+    parsed.parseError = result.error?.message || result.stderr || "The review did not complete successfully.";
+  }
   const payload = {
     review: reviewName,
     target,
@@ -550,6 +554,8 @@ async function executeTaskRun(request) {
     hostId: bridge.host.id,
     backendId: bridge.backend.id,
     rawOutput,
+    error: result.error?.message ?? null,
+    stderr: result.stderr ?? "",
     touchedFiles: result.touchedFiles,
     reasoningSummary: result.reasoningSummary
   };

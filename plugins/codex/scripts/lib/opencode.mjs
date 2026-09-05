@@ -1,9 +1,12 @@
-import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
-import { createOpenCodeEventCollector } from "./opencode-events.mjs";
 import { buildOpenCodeEnvironment } from "./opencode-policy.mjs";
+import { runOpenCodeProcess } from "./opencode-process.mjs";
+import { buildOpenCodeReviewPrompt, collectOpenCodeReviewContext } from "./opencode-review.mjs";
 import { binaryAvailable, runCommand } from "./process.mjs";
+import { validateStructuredOutput } from "./structured-output.mjs";
 
 const TASK_THREAD_PREFIX = "Agent Bridge Task";
 
@@ -19,46 +22,8 @@ function emitProgress(onProgress, message, phase, extra = {}) {
   onProgress?.({ message, phase, ...extra });
 }
 
-function runOpenCodeProcess(cwd, args, options = {}) {
-  return new Promise((resolve, reject) => {
-    const child = spawn("opencode", args, {
-      cwd,
-      env: options.env,
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true
-    });
-    let stdoutBuffer = "";
-    let stderr = "";
-    const collector = createOpenCodeEventCollector({ onProgress: options.onProgress });
-
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdoutBuffer += chunk;
-      const lines = stdoutBuffer.split(/\r?\n/);
-      stdoutBuffer = lines.pop() ?? "";
-      for (const line of lines) {
-        collector.consumeLine(line);
-      }
-    });
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-    child.on("error", reject);
-    child.on("close", (code, signal) => {
-      collector.consumeLine(stdoutBuffer);
-      resolve({
-        code: code ?? (signal ? 1 : 0),
-        signal,
-        stderr: stderr.trim(),
-        ...collector.result()
-      });
-    });
-  });
-}
-
-function buildRunArgs(cwd, options, prompt, agentName) {
-  const args = ["run", "--format", "json", "--dir", cwd, "--agent", agentName];
+function buildRunArgs(cwd, options, agentName) {
+  const args = ["run", "--format", "json", "--thinking", "--dir", cwd, "--agent", agentName];
   if (options.resumeThreadId) {
     args.push("--session", options.resumeThreadId);
   }
@@ -71,24 +36,39 @@ function buildRunArgs(cwd, options, prompt, agentName) {
   if (!options.resumeThreadId && options.threadName) {
     args.push("--title", options.threadName);
   }
-  args.push(prompt);
   return args;
 }
 
 export async function runOpenCodeTask(cwd, options = {}) {
-  const prompt = options.prompt?.trim() || options.defaultPrompt || "";
+  let prompt = options.prompt?.trim() || options.defaultPrompt || "";
   if (!prompt) {
     throw new Error("A prompt is required for this OpenCode run.");
+  }
+  if (options.outputSchema) {
+    prompt += `\n\nReturn only valid JSON matching this JSON Schema:\n${JSON.stringify(options.outputSchema)}`;
   }
   const { agentName, env } = buildOpenCodeEnvironment(options.sandbox, options.env ?? process.env);
   emitProgress(options.onProgress, options.resumeThreadId ? `Resuming OpenCode session ${options.resumeThreadId}.` : "Starting OpenCode task session.", "starting", {
     threadId: options.resumeThreadId ?? null
   });
-  const execution = await runOpenCodeProcess(cwd, buildRunArgs(cwd, options, prompt, agentName), {
+  const execution = await runOpenCodeProcess(cwd, buildRunArgs(cwd, options, agentName), {
     env,
+    prompt,
+    threadId: options.resumeThreadId,
     onProgress: options.onProgress
   });
-  const failure = execution.errorMessage || (execution.code !== 0 ? execution.stderr || `OpenCode exited with status ${execution.code}.` : "");
+  let failure = execution.errorMessage || (execution.code !== 0 ? execution.stderr || `OpenCode exited with status ${execution.code}.` : "");
+  failure ||= execution.inputError ? `Unable to send the complete OpenCode prompt: ${execution.inputError.message}` : "";
+  failure ||= !execution.finalMessage ? "OpenCode exited without a final assistant response." : "";
+  failure ||= !execution.completed ? "OpenCode exited before completing the response. The output may be partial; inspect the session before resuming." : "";
+  if (!failure && options.outputSchema) {
+    failure = validateStructuredOutput(execution.finalMessage, options.outputSchema);
+  }
+  emitProgress(options.onProgress, failure || "OpenCode session completed.", failure ? "failed" : "finalizing", {
+    threadId: execution.threadId,
+    logTitle: "Final output",
+    logBody: execution.finalMessage
+  });
   const invalidOutput = execution.invalidLines.length > 0 ? execution.invalidLines.join("\n") : "";
   return {
     status: failure ? execution.code || 1 : 0,
@@ -97,22 +77,19 @@ export async function runOpenCodeTask(cwd, options = {}) {
     finalMessage: execution.finalMessage,
     reasoningSummary: execution.reasoningSummary,
     error: failure ? new Error(failure) : null,
-    stderr: [execution.stderr, invalidOutput].filter(Boolean).join("\n"),
+    stderr: [...new Set([failure, execution.stderr, invalidOutput].filter(Boolean))].join("\n"),
     touchedFiles: execution.touchedFiles
   };
 }
 
-function buildReviewPrompt(target) {
-  if (target?.type === "baseBranch") {
-    return `Review the current branch against base branch ${target.branch}. Focus on concrete correctness, security, and regression risks. Return concise findings with file and line references; if there are no material findings, say so explicitly.`;
-  }
-  return "Review the current uncommitted changes. Focus on concrete correctness, security, and regression risks. Return concise findings with file and line references; if there are no material findings, say so explicitly.";
-}
-
 export async function runOpenCodeReview(cwd, options = {}) {
-  const result = await runOpenCodeTask(cwd, {
+  const target = options.target?.type === "baseBranch"
+    ? { mode: "branch", baseRef: options.target.branch, label: `branch diff against ${options.target.branch}` }
+    : { mode: "working-tree", label: "working tree diff" };
+  const context = collectOpenCodeReviewContext(cwd, target);
+  const result = await runOpenCodeTask(context.repoRoot, {
     ...options,
-    prompt: buildReviewPrompt(options.target),
+    prompt: buildOpenCodeReviewPrompt(context),
     sandbox: "read-only",
     threadName: "Agent Bridge Review"
   });
@@ -173,9 +150,29 @@ export async function findLatestOpenCodeTaskSession(cwd) {
   } catch (error) {
     throw new Error(`OpenCode returned invalid session JSON: ${error.message}`);
   }
-  return (Array.isArray(sessions) ? sessions : []).find((session) =>
-    typeof session.title === "string" && session.title.startsWith(TASK_THREAD_PREFIX) && (!session.directory || session.directory === cwd)
-  ) ?? null;
+  if (!Array.isArray(sessions)) {
+    throw new Error("OpenCode returned invalid session JSON: expected a session array.");
+  }
+  const directory = canonicalDirectory(cwd);
+  return sessions.filter((session) =>
+    typeof session?.id === "string" && session.id && !session.parentID && !session.time?.archived &&
+    typeof session.title === "string" &&
+    (session.title === TASK_THREAD_PREFIX || session.title.startsWith(`${TASK_THREAD_PREFIX}: `)) &&
+    typeof session.directory === "string" && path.isAbsolute(session.directory) && canonicalDirectory(session.directory) === directory
+  ).sort((left, right) => sessionUpdatedAt(right) - sessionUpdatedAt(left))[0] ?? null;
+}
+
+function canonicalDirectory(directory) {
+  try {
+    return fs.realpathSync(directory);
+  } catch {
+    return path.resolve(directory);
+  }
+}
+
+function sessionUpdatedAt(session) {
+  const value = session.time?.updated ?? session.updated ?? 0;
+  return typeof value === "number" ? value : Date.parse(value) || 0;
 }
 
 export function buildOpenCodeTaskThreadName(prompt) {
