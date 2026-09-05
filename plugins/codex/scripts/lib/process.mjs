@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import process from "node:process";
+import { terminatePosixProcessTree } from "./process-tree.mjs";
 
 export function runCommand(command, args = [], options = {}) {
   const result = spawnSync(command, args, {
@@ -55,7 +56,7 @@ function looksLikeMissingProcessMessage(text) {
 }
 
 export function terminateProcessTree(pid, options = {}) {
-  if (!Number.isFinite(pid)) {
+  if (!Number.isInteger(pid) || pid <= 1) {
     return { attempted: false, delivered: false, method: null };
   }
 
@@ -97,24 +98,7 @@ export function terminateProcessTree(pid, options = {}) {
     throw new Error(formatCommandFailure(result));
   }
 
-  try {
-    killImpl(-pid, "SIGTERM");
-    return { attempted: true, delivered: true, method: "process-group" };
-  } catch (error) {
-    if (error?.code !== "ESRCH") {
-      try {
-        killImpl(pid, "SIGTERM");
-        return { attempted: true, delivered: true, method: "process" };
-      } catch (innerError) {
-        if (innerError?.code === "ESRCH") {
-          return { attempted: true, delivered: false, method: "process" };
-        }
-        throw innerError;
-      }
-    }
-
-    return { attempted: true, delivered: false, method: "process-group" };
-  }
+  return terminatePosixProcessTree(pid, { runCommandImpl, killImpl, cwd: options.cwd, env: options.env });
 }
 
 export function formatCommandFailure(result) {

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.8
+
+- Cancel detached OpenCode tool processes as well as their worker on macOS/Linux by inspecting the
+  descendant tree before terminating it. Reject invalid process IDs and report discovery failures.
+- Add a real-process regression test with a child in a separate process group.
+
 ## 1.0.7
 
 - Supply actual Git evidence to OpenCode normal, adversarial, and stop-gate reviews.
